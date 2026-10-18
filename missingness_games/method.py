@@ -15,7 +15,10 @@ class Model(nn.Module):
             if index==0:priority=torch.rand_like(gap)
             elif index==1:priority=(torch.arange(d,device=x.device)[None]==(t//4)%d).float().expand(n,-1)
             elif index==2:priority=abs(history)
-            else:priority=torch.cos(torch.arange(d,device=x.device)[None]+t/3).expand(n,-1)
+            elif index==3:priority=torch.cos(torch.arange(d,device=x.device)[None]+t/3).expand(n,-1)
+            elif index==4:priority=-abs(history)
+            elif index==5:priority=torch.sin(torch.arange(d,device=x.device)[None]*6.283185/max(d,1)+(t//max(1,self.c.get('max_gap',4)))*3.141593).expand(n,-1)
+            else:raise ValueError('Unknown missingness policy')
             legal=(gap<self.c.get('max_gap',4))&observed[:,t];count=torch.minimum(budget,torch.full_like(budget,max(1,d//3)));delete=torch.zeros_like(gap,dtype=torch.bool)
             for row in range(n):
                 order=priority[row].masked_fill(~legal[row],-torch.inf).argsort(descending=True);chosen=order[:int(count[row])];chosen=chosen[legal[row,chosen]];delete[row,chosen]=True
@@ -31,6 +34,13 @@ class Model(nn.Module):
         probability=logits.softmax(-1).mean(1)
         if self.c['variant']=='baseline':probability=clean.softmax(-1)
         return {'probability':probability,'policy_logits':logits,'clean_logits':clean}
+    def selection_metrics(self,b):
+        """Frozen clean eligibility and worst represented-policy validation loss."""
+        raw=b['x'].float();observed=b.get('mask',torch.isfinite(raw)).bool();x=torch.nan_to_num(raw);y=b['y'].long()
+        with torch.no_grad():
+            clean=self.classify(x,observed.float())
+            losses=torch.stack([F.cross_entropy(self.classify(x,self.policy(x,k,observed)),y,reduction='none') for k in range(4)],1)
+        return int((clean.argmax(-1)!=y).sum()),float(losses.max(1).values.sum())
     def objective(self,b,p):
         y=b['y'].long();clean=F.cross_entropy(p['clean_logits'],y)
         if self.c['variant']=='baseline' or 'policy_logits' not in p:return clean

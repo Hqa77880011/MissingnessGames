@@ -41,8 +41,10 @@ def main():
         raise ValueError("Evaluation requires independent subject/run group IDs")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    excluded=saved.get('training_groups',[])+saved.get('validation_groups',[])+saved.get('calibration_groups',[])
+    if np.intersect1d(data['group'],excluded).size:raise ValueError('Evaluation groups overlap fitting/checkpoint/calibration groups')
     rows, condition_group_scores = [], []
-    for index, condition in enumerate(["clean", "random", "persistent", "history", "periodic"]):
+    for index, condition in enumerate(["clean", "random", "persistent", "history", "periodic", "heldout_low_history", "heldout_alternating_block"]):
         # The same seed, input order and batch size give all variants the same masks.
         torch.manual_seed(args.seed)
         probabilities, masks = [], []
@@ -75,7 +77,8 @@ def main():
     dump(output / "metrics.json", rows)
     dump(output / "summary.json", {
         "clean_subject_macro_accuracy": rows[0]["subject_macro_accuracy"],
-        "represented_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[1:]), axis=0).mean()),
+        "represented_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[1:5]), axis=0).mean()),
+        "heldout_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[5:]), axis=0).mean()),
         "conditions": [r["condition"] for r in rows],
         "seed": args.seed, "batch_size": args.batch_size,
         "deletion_fraction": config.get("deletion_fraction", .25),

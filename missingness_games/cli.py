@@ -115,6 +115,9 @@ def main():
             network.prepare(data)
         optimizer = torch.optim.AdamW(network.parameters(), lr=args.lr)
         history, best = [], float("inf")
+        clean_cap=float(config.get('clean_risk_cap',.5))
+        if not 0<=clean_cap<=1:raise ValueError('clean_risk_cap must lie in [0,1]')
+        saved_any=False
         start = time.perf_counter()
         for epoch in range(args.epochs):
             network.train()
@@ -131,17 +134,26 @@ def main():
                 train_loss += float(loss.detach()) * len(indices)
             network.eval()
             total = 0.
+            clean_errors=0
             for begin in range(0, len(validation["x"]), args.batch_size):
                 indices = np.arange(begin, min(begin + args.batch_size, len(validation["x"])))
                 batch = tensor_batch(validation, indices, args.device)
-                prediction = network(batch)
-                total += float(network.objective(batch, prediction).detach()) * len(indices)
+                devices=[torch.device(args.device)] if args.device.startswith('cuda') else []
+                with torch.random.fork_rng(devices=devices):
+                    torch.manual_seed(args.seed+begin)
+                    errors,robust_loss=network.selection_metrics(batch)
+                clean_errors+=errors
+                total+=robust_loss
             score = total / len(validation["x"])
-            history.append({"epoch": epoch + 1, "training_loss": train_loss / len(data["x"]), "validation_loss": score})
-            if score < best:
+            clean_risk=clean_errors/len(validation['x'])
+            eligible=clean_risk<=clean_cap
+            history.append({"epoch": epoch + 1, "training_loss": train_loss / len(data["x"]), "validation_loss": score, 'clean_risk':clean_risk,'eligible':eligible})
+            if eligible and score < best:
+                saved_any=True
                 best = score
                 torch.save({"state": network.state_dict(), "config": config, "training_groups": np.unique(data.get("group", np.arange(len(data["x"])))).tolist(), "validation_groups": np.unique(validation.get("group", np.arange(len(validation["x"])))).tolist()}, out / "model.pt")
         dump(out / "history.json", history)
+        if not saved_any:raise RuntimeError('No checkpoint meets the predeclared clean_risk_cap; inspect history.json')
         dump(out / "training.json", {"seconds": time.perf_counter() - start, "best_validation_loss": best})
     elif args.command == "calibrate":
         from scipy.optimize import minimize_scalar
@@ -174,6 +186,7 @@ def main():
             unit = [score[data["group"] == group].max() for group in np.unique(data["group"])]
             rank = int(np.ceil((len(unit)+1)*.9))
             state["interval_expansion"] = float(np.sort(unit)[rank-1]) if rank <= len(unit) else float("inf")
+        state["calibration_groups"]=np.unique(data["group"]).tolist()
         torch.save(state, out)
     elif args.command == "evaluate":
         state = torch.load(args.model, map_location=args.device, weights_only=True)

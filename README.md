@@ -33,7 +33,7 @@ missingness-games evaluate --input data/prepared/test.npz --model runs/full/mode
 missingness-games plot --input runs --output runs/figures
 ```
 
-Training uses AdamW and selects the minimum validation objective. `model.pt` stores parameters and configuration; `history.json` records training/validation objectives. Evaluation exports predictions and mechanism tensors to `predictions.npz` and computed scores to `metrics.json`. Plotting exports comparison charts from those actual evaluation files.
+Training uses AdamW and selects the lowest represented worst-policy loss among checkpoints satisfying the predeclared clean-risk cap. `model.pt` stores parameters and configuration; `history.json` records training/validation objectives. Evaluation exports predictions and mechanism tensors to `predictions.npz` and computed scores to `metrics.json`. Plotting exports comparison charts from those actual evaluation files.
 
 `--device cpu` is the default; `--device cuda` selects CUDA. `--lr`, `--epochs`, `--batch-size`, and `--seed` control optimization. Method parameters are in `config.json`; `--set key=value` overrides one value using JSON syntax. Use identical splits and seeds across comparisons.
 
@@ -66,7 +66,7 @@ The implementation uses the explicit core operations described above with config
 
 ## Evaluating observation policies
 
-Inference applies one frozen predictor to the observations and optional `mask[N,T,D]` supplied in the input. The training policy bank and loss memory are not executed as a test-time ensemble. Native missing entries may use a zero mask or NaN values; hidden values do not enter the predictor. Validation checkpoint selection uses clean/native-observation cross entropy in this compact implementation; the paper's separate clean-risk eligibility guard is not implemented.
+Inference applies one frozen predictor to the observations and optional `mask[N,T,D]` supplied in the input. The training policy bank and loss memory are not executed as a test-time ensemble. Native missing entries may use a zero mask or NaN values; hidden values do not enter the predictor. Validation applies the predeclared clean-risk eligibility guard and ranks eligible checkpoints by worst represented-policy cross entropy.
 
 Evaluate the represented conditions separately, with identical masks for all trained variants:
 
@@ -74,4 +74,8 @@ Evaluate the represented conditions separately, with identical masks for all tra
 python -m missingness_games.evaluate_policies --input data/prepared/test.npz --model runs/full/model.pt --output runs/full/policies --seed 13 --batch-size 16
 ```
 
-Use the same evaluation seed, batch size, deletion fraction and maximum gap for every variant, including the clean-trained baseline. `--deletion-fraction` and `--max-gap` set a declared stress condition. The command saves one prediction/mask archive per condition, clean and per-policy subject-mean balanced accuracy, and the minimum represented-policy endpoint. This is not an unseen-policy result. `group` must identify independent subjects/runs, not individual overlapping windows. Existing `evaluate` evaluates only the supplied observation condition.
+Use the same evaluation seed, batch size, deletion fraction and maximum gap for every variant, including the clean-trained baseline. `--deletion-fraction` and `--max-gap` set a declared stress condition. The command saves one prediction/mask archive per condition, clean and per-policy subject-mean balanced accuracy, and the minimum represented-policy endpoint. The represented endpoint and two explicitly held-out policy families are reported separately. `group` must identify independent subjects/runs, not individual overlapping windows. Existing `evaluate` evaluates only the supplied observation condition.
+
+## Selected reproduction setting
+
+Use width 32, deletion fraction 0.25, maximum gap 4, EMA 0.9 and temperature 0.2. Before training, freeze clean_risk_cap=0.5 (or set a justified alternative on development data). A checkpoint is eligible only when clean validation 0/1 risk meets this cap; eligible checkpoints minimize per-example worst represented-policy cross entropy. No eligible checkpoint raises an error after saving history. The policy evaluator also reports two held-out causal families: low-history priority and alternating sensor blocks. These families are absent from training and checkpoint selection. All variants share masks/seed/batch size, and subject-level minima are averaged after taking each subject's worst policy.
