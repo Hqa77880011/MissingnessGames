@@ -63,3 +63,15 @@ Classification reports accuracy, balanced accuracy, macro-F1, NLL, confidence EC
 Parameter counts and forward timing describe the executing process. Use batch size one and a declared device configuration for device latency comparisons. Physical energy and scores from external task evaluators require measured inputs; they are not inferred from parameter counts. All prediction arrays remain available for task-specific evaluation.
 
 The implementation uses the explicit core operations described above with configurable compact networks. Numeric conventions and application-specific information are stated with the method and data schema. The parameter file contains the current defaults.
+
+## Evaluating observation policies
+
+Inference applies one frozen predictor to the observations and optional `mask[N,T,D]` supplied in the input. The training policy bank and loss memory are not executed as a test-time ensemble. Native missing entries may use a zero mask or NaN values; hidden values do not enter the predictor. Validation checkpoint selection uses clean/native-observation cross entropy in this compact implementation; the paper's separate clean-risk eligibility guard is not implemented.
+
+Evaluate the represented conditions separately, with identical masks for all trained variants:
+
+```bash
+python -m missingness_games.evaluate_policies --input data/prepared/test.npz --model runs/full/model.pt --output runs/full/policies --seed 13 --batch-size 16
+```
+
+Use the same evaluation seed, batch size, deletion fraction and maximum gap for every variant, including the clean-trained baseline. `--deletion-fraction` and `--max-gap` set a declared stress condition. The command saves one prediction/mask archive per condition, clean and per-policy subject-mean balanced accuracy, and the minimum represented-policy endpoint. This is not an unseen-policy result. `group` must identify independent subjects/runs, not individual overlapping windows. Existing `evaluate` evaluates only the supplied observation condition.
