@@ -138,7 +138,12 @@ def train(args, config, output):
 
 def load_model(path, device):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    model = Model(checkpoint['config']).to(device).eval()
+    if checkpoint['config'].get('backbone')=='random_forest':
+        import joblib
+        from .forest import ForestModel
+        model=ForestModel(checkpoint['config']).to(device).eval()
+        model.forest=joblib.load(Path(path).with_suffix('.joblib'))
+    else:model = Model(checkpoint['config']).to(device).eval()
     model.load_state_dict(checkpoint['state'])
     return model, checkpoint
 

@@ -138,6 +138,15 @@ def main():
         with patch.object(sys,'argv',['evaluate_policies','--input',str(root/'data/test.npz'),'--model',str(root/backbone/'model.pt'),'--output',str(root/backbone/'policies')]):evaluate_policies.main()
         a=np.load(root/'policies/history_burst.npz')['mask'];b=np.load(root/backbone/'policies/history_burst.npz')['mask']
         np.testing.assert_equal(a,b)
+    from missingness_games.forest import main as forest_main,summaries
+    toy=torch.tensor([[[2.],[100.],[4.]]]);mask=torch.tensor([[[1.],[0.],[1.]]])
+    summary=summaries(toy,mask);np.testing.assert_allclose(summary[0,:5],[3,1,2,4,4])
+    with patch.object(sys,'argv',['forest','--input',str(root/'data'),'--output',str(root/'random_forest'),'--trees','12','--batch-size','16']):forest_main()
+    forest,_=cli.load_model(root/'random_forest/model.pt','cpu');expected=forest(batch)['probability']
+    restored,_=cli.load_model(root/'random_forest/model.pt','cpu');torch.testing.assert_close(expected,restored(batch)['probability'])
+    invoke('evaluate','--input',root/'data/test.npz','--model',root/'random_forest/model.pt','--output',root/'random_forest/evaluation')
+    with patch.object(sys,'argv',['evaluate_policies','--input',str(root/'data/test.npz'),'--model',str(root/'random_forest/model.pt'),'--output',str(root/'random_forest/policies')]):evaluate_policies.main()
+    np.testing.assert_equal(np.load(root/'policies/history_burst.npz')['mask'],np.load(root/'random_forest/policies/history_burst.npz')['mask'])
     print(json.dumps(dict(status='passed',variants=len(VARIANTS),epochs=1,policy_causality=True,
         checkpoint_equal=True,metric_example=True,raw_schema_readers=True,functional_guard_tolerance=2.)))
 

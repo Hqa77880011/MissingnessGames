@@ -7,8 +7,7 @@ import numpy as np
 import torch
 from .panels import macro_accuracy
 
-from .cli import dump, read, tensor_batch
-from .method import Model
+from .cli import dump, read, tensor_batch, load_model
 from .metrics import measure
 
 
@@ -37,8 +36,8 @@ def main():
         config["deletion_fraction"] = args.deletion_fraction
     if args.max_gap is not None:
         config["max_gap"] = args.max_gap
-    model = Model(config).to(args.device).eval()
-    model.load_state_dict(saved["state"])
+    model,_=load_model(args.model,args.device)
+    model.c.update(config)
     model.c["evaluation_history_quantile"]=.6
     data = read(args.input)
     if "group" not in data:
