@@ -1,0 +1,4 @@
+[
+  {"name":"heldout_history_q60","trigger":"high","threshold_quantile":0.6,"duration_fraction":[0.125,0.25],"start_probability":0.1},
+  {"name":"heldout_history_duration","trigger":"high","threshold_quantile":0.75,"duration_fraction":[0.0625,0.25],"start_probability":0.1}
+]

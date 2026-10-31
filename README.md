@@ -65,7 +65,7 @@ missingness-games train --input data/har --output runs/dro --config data/har.con
 missingness-games train --input data/har --output runs/uniform --config data/har.config.json --reference runs/clean/model.pt --variant fixed_bank --seed 13
 ```
 
-The external GRU-D, BRITS, SAITS, TimesNet and BIOT models are not bundled. Native-completeness/activity-rarity panels require the paper's frozen stratum specification and analysis of exported predictions; this implementation supplies support/masks without fabricating those experimental panels. This compact reference retains the four policy-view graphs until weighting, yielding the stated gradient while using more memory than the manuscript's sequential accumulation strategy. No training-work or hardware-performance result is prefilled.
+The external GRU-D, BRITS, SAITS, TimesNet and BIOT models are not bundled. Native-completeness/activity-rarity panels are now generated as described below. This compact reference retains the four policy-view graphs until weighting, yielding the stated gradient while using more memory than the manuscript's sequential accumulation strategy. No training-work or hardware-performance result is prefilled.
 
 ## Outputs and verification
 
@@ -85,3 +85,9 @@ python verify.py --output runs/functional-check
 ```
 
 Actual CPU check environment: Python 3.13.5, PyTorch 2.7.1+cu118, NumPy 2.1.3, seed 13, one thread. The check uses generated inputs, ten variants for one epoch, raw-release schema fixtures, finite forward/loss/backward, encoder/head gradients and parameter changes, exact first-memory/EMA response, whole-action fallback, budget/gap/causality/hidden-value invariants, checkpoint equality, clean and policy evaluation, calibration, a training-only pilot, count-preserving shuffle and hand-calculated Brier/ECE/subject metrics. The functional fixture declares guard tolerance 2.0 solely to exercise every variant in one epoch; primary experiments retain 0.015.
+
+## Frozen held-out and native-rarity panels
+
+The packaged `missingness_games/heldout.json` fixes two primary unseen high-history rules before testing: training 60th/75th-percentile thresholds and per-burst uniform duration fractions [0.125,0.25]/[0.0625,0.25]. Duration is drawn at burst start and held in explicit policy state. `--heldout path.json` declares an alternate pre-test bank; a reversed-history failure bank uses trigger low. Every evaluation saves its bank.
+
+`panels.json` and `panels.png` implement native-completeness and completeness x rarity panels. The completeness cutpoint is the training-window median originally observed-entry fraction. Rare activities are the lowest ceiling(K/4) supported classes by training-only observed labeled duration, ties by activity code. PAMAP2 exporter computes duration on native Protocol rows before window caps. Custom NPZ may supply class_duration[K] seconds; otherwise observed window-time support is the explicit fallback. Within each subject/stratum/policy, accuracy is class-macro averaged; policy minima precede eligible-subject averaging. Empty cells retain null means and zero eligible subjects. Functional checks include the frozen bank, six panel cells, rare-class tie-breaking and hand-calculated subject minima.

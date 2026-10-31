@@ -46,7 +46,7 @@ def prepare(source, output):
             raise ValueError('Every declared split must be nonempty')
         if any(np.intersect1d(groups[selected], groups[other]).size for other in masks[:i]):
             raise ValueError('A subject/run group crosses split boundaries')
-        values = {key: value[selected] if value.ndim and len(value) == n else value for key, value in data.items() if key != 'split'}
+        values = {key: value[selected] if key not in ('class_duration','activity_codes') and value.ndim and len(value) == n else value for key, value in data.items() if key != 'split'}
         values['group'] = groups[selected]
         np.savez_compressed(output / f'{name}.npz', **values)
 

@@ -93,6 +93,15 @@ def main():
         evaluate_policies.main()
     a=np.load(root/'policies/channel_burst.npz')['mask'];b=np.load(root/'shuffled/channel_burst.npz')['mask']
     np.testing.assert_equal(a.sum(1),b.sum(1))
+    panel=json.loads((root/'policies/panels.json').read_text())
+    assert len(panel['panels'])==6 and panel['training_native_boundary']==1.
+    assert panel['rare_classes']==[0]
+    from missingness_games.panels import panels
+    example=dict(x=np.ones((4,2,1)),y=np.array([0,1,0,1]),group=np.array([1,1,2,2]))
+    perfect=np.eye(2)[example['y']];bad=perfect[::-1]
+    handmade=panels(dict(clean=perfect,bank=perfect,heldout=bad),example,1.,[0],['bank'],['heldout'])
+    high=next(row for row in handmade['panels'] if row['completeness']=='higher' and row['rarity']=='all')
+    assert high['clean']==1 and high['heldout_worst']==0
     metric=measure(dict(probability=np.array([[.8,.2],[.4,.6]])),dict(y=np.array([0,1]),group=np.array([0,1])))
     assert abs(metric['brier']-.2)<1e-12 and abs(metric['ece']-.3)<1e-12 and metric['subject_macro_accuracy']==1
     # Released file-layout readers are checked with small schema fixtures.

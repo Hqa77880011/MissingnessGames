@@ -14,3 +14,6 @@ missingness-games = "missingness_games.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["missingness_games*"]
+
+[tool.setuptools.package-data]
+missingness_games = ["heldout.json"]

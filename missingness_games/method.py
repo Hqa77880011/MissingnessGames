@@ -35,6 +35,8 @@ class Model(nn.Module):
         self.register_buffer('dro_weights', reference / reference.sum())
         self.register_buffer('history_threshold', torch.tensor(0.))
         self.register_buffer('history_shift_threshold', torch.tensor(0.))
+        self.register_buffer('native_boundary',torch.tensor(1.))
+        self.register_buffer('rare_classes',torch.zeros(classes,dtype=torch.bool))
         self.last_diagnostics = {}
 
     def prepare(self, data):
@@ -48,6 +50,11 @@ class Model(nn.Module):
                 raise ValueError(f'No observed training values in channel {channel}')
             means.append(float(values.mean())); scales.append(max(float(values.std()), 1e-6))
         self.mean.copy_(self.mean.new_tensor(means)); self.scale.copy_(self.scale.new_tensor(scales))
+        self.native_boundary.fill_(float(np.median(observed.mean((1,2)))))
+        duration=np.asarray(data.get('class_duration',np.bincount(data['y'].astype(int),weights=observed.any(2).sum(1),minlength=len(self.class_weights))),float)
+        supported=np.flatnonzero(duration>0)
+        rare=supported[np.lexsort((supported,duration[supported]))[:int(np.ceil(len(supported)/4))]]
+        self.rare_classes.zero_();self.rare_classes[torch.as_tensor(rare,device=self.rare_classes.device)]=True
         counts = np.bincount(data['y'].astype(int), minlength=len(self.class_weights))
         if (counts == 0).any():
             raise ValueError('All declared classes need training support')
@@ -83,6 +90,8 @@ class Model(nn.Module):
         budget = torch.full((n,), int(time * channels * fraction), device=x.device, dtype=torch.long)
         history = x.new_zeros(n)
         masks = []
+        specification=self.c.get('evaluation_policy') if index>=4 else None
+        heldout_duration=torch.zeros((n,len(groups)),device=x.device,dtype=torch.long)
         threshold = self.history_shift_threshold if self.updates + 1 >= self.c.get('history_shift_update', 51) else self.history_threshold
         for t in range(time):
             if index == 0:
@@ -97,11 +106,21 @@ class Model(nn.Module):
                 if index == 5:
                     duration = max(1, maximum // 2 + (t % max(1, maximum // 2)))
                 probability = self.c.get('group_start_probability', 32 / max(9 * time, 1)) if index == 2 else self.c.get('history_start_probability', .1)
-                for group in groups:
+                for group_index,group in enumerate(groups):
                     clock = gap[:, group].max(1).values
                     trigger = torch.rand(n, device=x.device) < probability
                     if index in (3, 4):
                         trigger &= history > threshold if index == 3 else history <= threshold
+                    if specification:
+                        quantile=specification.get('threshold_quantile',.6)
+                        if quantile not in (.6,.75):raise ValueError('Held-out threshold must be frozen training quantile .6 or .75')
+                        cut=self.history_shift_threshold if quantile==.6 else self.history_threshold
+                        trigger=torch.rand(n,device=x.device)<specification.get('start_probability',.1)
+                        trigger &= history>cut if specification.get('trigger','high')=='high' else history<=cut
+                        lower,upper=specification.get('duration_fraction',[.125,.25])
+                        sampled=torch.randint(max(1,int(time*lower)),max(1,int(time*upper))+1,(n,),device=x.device)
+                        heldout_duration[:,group_index]=torch.where((clock==0)&trigger,sampled,heldout_duration[:,group_index])
+                        duration=heldout_duration[:,group_index]
                     action = ((clock > 0) & (clock < duration)) | ((clock == 0) & trigger)
                     proposal[:, group] = action[:, None]
             else:

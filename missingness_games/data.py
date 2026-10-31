@@ -43,8 +43,13 @@ def pamap2(root, test_subject=101, seed=13, cap=100, window=256, stride=128):
     # UCI 54-column schema, zero based: IMU blocks start at 3,20,37.
     columns = [start+offset for start in (3,20,37) for offset in (1,2,3,7,8,9)]
     x,y,group,split = [],[],[],[]
+    class_duration=np.zeros(len(PAMAP_ACTIVITIES))
     for subject in subjects:
         table = np.loadtxt(root/'Protocol'/f'subject{subject}.dat', dtype=np.float32, ndmin=2)
+        if subject not in (test_subject,validation_subject):
+            available=np.isfinite(table[:,columns]).any(1)
+            for label,activity in enumerate(PAMAP_ACTIVITIES):
+                class_duration[label]+=float(((table[:,1]==activity)&available).sum())/100
         for start in range(0,len(table)-window+1,stride):
             clip=table[start:start+window]
             activity=int(clip[0,1])
@@ -62,6 +67,8 @@ def pamap2(root, test_subject=101, seed=13, cap=100, window=256, stride=128):
             keep.extend(ids)
     ids=np.sort(keep);data={key:value[ids] for key,value in data.items()}
     data['mask']=np.isfinite(data['x'])
+    data['class_duration']=class_duration
+    data['activity_codes']=np.asarray(PAMAP_ACTIVITIES)
     return data, [list(range(start,start+6)) for start in (0,6,12)]
 
 

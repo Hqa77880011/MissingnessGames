@@ -1,10 +1,11 @@
 """Evaluate each observation condition separately with the same frozen predictor."""
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import balanced_accuracy_score
+from .panels import macro_accuracy
 
 from .cli import dump, read, tensor_batch
 from .method import Model
@@ -21,6 +22,7 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--deletion-fraction", type=float)
     parser.add_argument("--max-gap", type=int)
+    parser.add_argument("--heldout",help="Frozen pre-test held-out bank JSON")
     parser.add_argument("--shuffle-masks", action="store_true", help="Count-preserving temporal intervention within originally observed positions")
     args = parser.parse_args()
     if args.batch_size < 1:
@@ -44,8 +46,14 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     excluded=saved.get('training_groups',[])+saved.get('validation_groups',[])+saved.get('calibration_groups',[])
     if np.intersect1d(data['group'],excluded).size:raise ValueError('Evaluation groups overlap fitting/checkpoint/calibration groups')
-    rows, condition_group_scores = [], []
-    for index, condition in enumerate(["clean", "independent", "channel_burst", "group_burst", "history_burst", "heldout_reverse_history", "heldout_duration_shift"]):
+    bank=json.loads(Path(args.heldout).read_text(encoding="utf-8-sig")) if args.heldout else json.loads(Path(__file__).with_name("heldout.json").read_text(encoding="utf-8-sig"))
+    represented=["independent","channel_burst","group_burst","history_burst"]
+    heldout=[entry["name"] for entry in bank]
+    conditions=["clean",*represented,*heldout]
+    if len(set(conditions))!=len(conditions):raise ValueError("Unique condition names required")
+    rows, condition_group_scores, condition_probabilities = [], [], {}
+    for index, condition in enumerate(conditions):
+        model.c['evaluation_policy']=bank[index-5] if index>=5 else None
         # The same seed, input order and batch size give all variants the same masks.
         torch.manual_seed(args.seed)
         probabilities, masks = [], []
@@ -56,7 +64,7 @@ def main():
                 raw = batch["x"].float()
                 observed = batch.get("mask", torch.isfinite(raw)).bool()
                 values = torch.nan_to_num(raw)
-                mask = observed.float() if index == 0 else model.policy(values, index - 1, observed)
+                mask = observed.float() if index == 0 else model.policy(values, min(index-1,4), observed)
                 if args.shuffle_masks and index > 0:
                     for row in range(len(mask)):
                         for channel in range(mask.shape[2]):
@@ -69,9 +77,10 @@ def main():
                 probabilities.append(prediction.cpu().numpy())
                 masks.append(mask.cpu().numpy())
         probability, mask = np.concatenate(probabilities), np.concatenate(masks)
+        condition_probabilities[condition]=probability
         metrics = measure({"probability": probability}, data)
         group_scores = [
-            balanced_accuracy_score(data["y"][data["group"] == group],
+            macro_accuracy(data["y"][data["group"] == group],
                                     probability[data["group"] == group].argmax(-1))
             for group in np.unique(data["group"])
         ]
@@ -89,12 +98,24 @@ def main():
         rows.append(metrics)
         np.savez_compressed(output / (condition + ".npz"), probability=probability,
                             mask=mask, y=data["y"], group=data["group"])
+    from .panels import panels
+    panel=panels(condition_probabilities,data,float(model.native_boundary),model.rare_classes.nonzero().flatten().cpu().tolist(),represented,heldout)
+    panel['heldout_bank']=bank
+    dump(output/'panels.json',panel)
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    selected=[row for row in panel['panels'] if row['heldout_worst'] is not None]
+    figure,axis=plt.subplots(figsize=(9,4))
+    axis.bar([row['completeness']+':'+row['rarity'] for row in selected],[row['heldout_worst'] for row in selected])
+    axis.set_ylabel('Subject macro worst-policy accuracy');axis.tick_params(axis='x',labelrotation=25)
+    figure.tight_layout();figure.savefig(output/'panels.png',dpi=160);plt.close(figure)
     dump(output / "metrics.json", rows)
     dump(output / "summary.json", {
         "clean_subject_macro_accuracy": rows[0]["subject_macro_accuracy"],
         "represented_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[1:5]), axis=0).mean()),
         "heldout_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[5:]), axis=0).mean()),
-        "conditions": [r["condition"] for r in rows],
+        "conditions": [r["condition"] for r in rows], "heldout_bank":bank,
         "seed": args.seed, "batch_size": args.batch_size, "count_preserving_temporal_shuffle": args.shuffle_masks,
         "deletion_fraction": config.get("deletion_fraction", .4),
         "max_gap": config.get("max_gap", data["x"].shape[1] // 4),
