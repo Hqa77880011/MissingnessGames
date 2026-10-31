@@ -12,6 +12,6 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install .
+      - run: python -m pip install .[baselines]
       - run: python -m compileall -q missingness_games verify.py
       - run: python verify.py

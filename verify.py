@@ -120,6 +120,24 @@ def main():
     assert exported['x'].shape[-1]==18 and not exported['mask'].all()
     assert set(exported['split'])=={0,1,2}
     invoke('plot','--input',root/'evaluation','--output',root/'figures')
+    for backbone in ('grud','brits','saits','timesnet','biot'):
+        adapted=Model(dict(config,backbone=backbone,variant='fixed_bank'))
+        adapted.prepare(data);adapted.train();output=adapted(batch);loss=adapted.objective(batch,output)
+        assert torch.isfinite(loss);optimizer=torch.optim.Adam(adapted.parameters(),lr=.001)
+        parameter=next(p for p in adapted.encoder.parameters() if p.requires_grad)
+        before=parameter.detach().clone();optimizer.zero_grad();loss.backward()
+        assert parameter.grad is not None and parameter.grad.abs().sum()>0
+        optimizer.step();assert not torch.equal(before,parameter)
+        adapted.eval();expected=adapted(batch)['probability'].detach()
+        torch.save(adapted.state_dict(),root/f'{backbone}.pt')
+        restored=Model(dict(config,backbone=backbone,variant='fixed_bank')).eval()
+        restored.load_state_dict(torch.load(root/f'{backbone}.pt',weights_only=True))
+        torch.testing.assert_close(expected,restored(batch)['probability'],rtol=1e-5,atol=1e-6)
+        invoke('train','--input',root/'data','--output',root/backbone,'--config',root/'config.json','--set',f'backbone="{backbone}"','--variant','fixed_bank','--epochs',1,'--reference',root/'baseline/model.pt')
+        invoke('evaluate','--input',root/'data/test.npz','--model',root/backbone/'model.pt','--output',root/backbone/'evaluation')
+        with patch.object(sys,'argv',['evaluate_policies','--input',str(root/'data/test.npz'),'--model',str(root/backbone/'model.pt'),'--output',str(root/backbone/'policies')]):evaluate_policies.main()
+        a=np.load(root/'policies/history_burst.npz')['mask'];b=np.load(root/backbone/'policies/history_burst.npz')['mask']
+        np.testing.assert_equal(a,b)
     print(json.dumps(dict(status='passed',variants=len(VARIANTS),epochs=1,policy_causality=True,
         checkpoint_equal=True,metric_example=True,raw_schema_readers=True,functional_guard_tolerance=2.)))
 

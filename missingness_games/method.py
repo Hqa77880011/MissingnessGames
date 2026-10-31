@@ -21,7 +21,11 @@ class Model(nn.Module):
             nn.Conv1d(3 * features, width, 3, padding=1), nn.ReLU(),
             nn.Conv1d(width, width, 3, padding=2, dilation=2), nn.ReLU(),
             nn.Conv1d(width, width, 3, padding=4, dilation=4), nn.ReLU())
-        self.head = nn.Linear(width, classes)
+        self.backbone_name=config.get('backbone','tcn')
+        if self.backbone_name!='tcn':
+            from .baselines import ClassificationBackbone
+            self.encoder=ClassificationBackbone(self.backbone_name,config['input_shape'][0],features,width,classes,config)
+        self.head = nn.Identity() if self.backbone_name in ("timesnet","biot") else nn.Linear(width, classes)
         self.register_buffer('mean', torch.zeros(features))
         self.register_buffer('scale', torch.ones(features))
         self.register_buffer('class_weights', torch.ones(classes))
@@ -93,6 +97,8 @@ class Model(nn.Module):
         specification=self.c.get('evaluation_policy') if index>=4 else None
         heldout_duration=torch.zeros((n,len(groups)),device=x.device,dtype=torch.long)
         threshold = self.history_shift_threshold if self.updates + 1 >= self.c.get('history_shift_update', 51) else self.history_threshold
+        if 'evaluation_history_quantile' in self.c:
+            threshold=self.history_shift_threshold if self.c['evaluation_history_quantile']==.6 else self.history_threshold
         for t in range(time):
             if index == 0:
                 proposal = torch.rand(n, channels, device=x.device) < self.c.get('independent_probability', .4)
@@ -143,6 +149,11 @@ class Model(nn.Module):
             gap = (gap + 1) * (1 - mask[:, step])
             elapsed.append(gap)
         features = torch.cat([torch.where(mask.bool(), x, 0.), mask, torch.stack(elapsed, 1) / mask.shape[1]], -1)
+        if self.backbone_name!='tcn':
+            code=self.encoder(torch.where(mask.bool(),x,0.),mask)
+            self.last_auxiliary=self.encoder.auxiliary_loss
+            return self.head(code)
+        self.last_auxiliary=x.new_zeros(())
         code = self.encoder(features.transpose(1, 2)).transpose(1, 2)
         valid = mask.any(-1).float()
         pooled = (code * valid[:, :, None]).sum(1) / valid.sum(1, keepdim=True).clamp_min(1)
@@ -152,12 +163,20 @@ class Model(nn.Module):
         raw = batch['x'].float()
         observed = batch.get('mask', torch.isfinite(raw)).bool() & torch.isfinite(raw)
         clean = self.classify(raw, observed)
+        auxiliary=[self.last_auxiliary]
         result = dict(probability=clean.softmax(-1), clean_logits=clean)
         if self.training and self.c['variant'] != 'baseline':
             indices = [0] * 4 if self.c['variant'] == 'independent_masks' else range(4)
-            masks = [self.policy(raw, index, observed) for index in indices]
-            result['policy_logits'] = torch.stack([self.classify(raw, mask) for mask in masks], 1)
+            devices=[raw.device.index or 0] if raw.is_cuda else []
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(self.c.get('seed',13)+int(self.updates)*1000003)
+                masks = [self.policy(raw, index, observed) for index in indices]
+            views=[]
+            for mask in masks:
+                views.append(self.classify(raw,mask));auxiliary.append(self.last_auxiliary)
+            result['policy_logits']=torch.stack(views,1)
             result['realized_missing_rates'] = torch.stack([(observed.float() - mask).mean() for mask in masks])
+        result['auxiliary_loss']=torch.stack(auxiliary).mean()
         return result
 
     def cross_entropy(self, logits, target):
@@ -173,7 +192,7 @@ class Model(nn.Module):
         return float(clean.sum()), losses.sum(0).cpu().numpy()
 
     def objective(self, batch, prediction):
-        clean = self.cross_entropy(prediction['clean_logits'], batch['y']).mean()
+        clean = self.cross_entropy(prediction['clean_logits'], batch['y']).mean()+self.c.get('reconstruction_weight',1.)*prediction.get('auxiliary_loss',0.)
         if self.c['variant'] == 'baseline':
             return clean
         losses = torch.stack([self.cross_entropy(prediction['policy_logits'][:, k], batch['y']).mean() for k in range(4)])

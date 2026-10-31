@@ -7,7 +7,7 @@ Implementation of **Missingness-Mechanism Games for Robust Multisensor Represent
 Python >=3.10, PyTorch, NumPy, SciPy, scikit-learn and Matplotlib:
 
 ```bash
-python -m pip install -e .
+python -m pip install -e .[baselines]
 ```
 
 ## Data
@@ -65,7 +65,7 @@ missingness-games train --input data/har --output runs/dro --config data/har.con
 missingness-games train --input data/har --output runs/uniform --config data/har.config.json --reference runs/clean/model.pt --variant fixed_bank --seed 13
 ```
 
-The external GRU-D, BRITS, SAITS, TimesNet and BIOT models are not bundled. Native-completeness/activity-rarity panels are now generated as described below. This compact reference retains the four policy-view graphs until weighting, yielding the stated gradient while using more memory than the manuscript's sequential accumulation strategy. No training-work or hardware-performance result is prefilled.
+Actual licensed GRU-D, BRITS, SAITS, TimesNet and BIOT architectures are now integrated through the common training/evaluation interface below. Native-completeness/activity-rarity panels are now generated as described below. This compact reference retains the four policy-view graphs until weighting, yielding the stated gradient while using more memory than the manuscript's sequential accumulation strategy. No training-work or hardware-performance result is prefilled.
 
 ## Outputs and verification
 
@@ -91,3 +91,30 @@ Actual CPU check environment: Python 3.13.5, PyTorch 2.7.1+cu118, NumPy 2.1.3, s
 The packaged `missingness_games/heldout.json` fixes two primary unseen high-history rules before testing: training 60th/75th-percentile thresholds and per-burst uniform duration fractions [0.125,0.25]/[0.0625,0.25]. Duration is drawn at burst start and held in explicit policy state. `--heldout path.json` declares an alternate pre-test bank; a reversed-history failure bank uses trigger low. Every evaluation saves its bank.
 
 `panels.json` and `panels.png` implement native-completeness and completeness x rarity panels. The completeness cutpoint is the training-window median originally observed-entry fraction. Rare activities are the lowest ceiling(K/4) supported classes by training-only observed labeled duration, ties by activity code. PAMAP2 exporter computes duration on native Protocol rows before window caps. Custom NPZ may supply class_duration[K] seconds; otherwise observed window-time support is the explicit fallback. Within each subject/stratum/policy, accuracy is class-macro averaged; policy minima precede eligible-subject averaging. Empty cells retain null means and zero eligible subjects. Functional checks include the frozen bank, six panel cells, rare-class tie-breaking and hand-calculated subject minima.
+
+## External architecture comparisons
+
+The `backbone` configuration selects actual upstream architectures, retaining their defining operations rather than renaming a generic predictor:
+
+| Backbone | Upstream source / pinned commit | Retained operations / adaptation |
+|---|---|---|
+| grud / brits / saits | [PyPOTS](https://github.com/WenjieDu/PyPOTS), 2271533587bab250163437ed39cfe13cefd8b80a, BSD-3-Clause | Learned temporal decay; bidirectional RITS consistency/reconstruction; two DMSA blocks and attention-weighted reconstruction. A classification head is trained on the shared labels. |
+| timesnet | [Time-Series-Library](https://github.com/thuml/Time-Series-Library), 4e938a1767106324dd753b2a44832bf870a0252e, MIT | FFT period discovery, 2D Inception variations and adaptive period aggregation; actual classification path, two blocks. |
+| biot | [BIOT](https://github.com/ycq091044/BIOT), d138e32634e52ae9fa6ec98ac9c4087b14ca869a, MIT | Per-channel STFT frequency tokens, channel/position embeddings and linear-attention Transformer, two blocks; no pretrained weights are loaded. |
+
+Upstream licenses are retained beside each vendored implementation and included in package data. Changes to upstream algorithm files are limited to package-relative TimesNet imports and fixing BIOT channel embedding width to use its emb_size argument (the original hard-coded 256 prevents the paper 128-wide adaptation). Empty package initializers avoid importing unrelated upstream frameworks.
+
+```bash
+missingness-games train --input data/har --output runs/grud --config data/har.config.json --variant fixed_bank --reference runs/clean/model.pt --set 'backbone="grud"' --seed 13
+missingness-games train --input data/har --output runs/brits --config data/har.config.json --variant fixed_bank --reference runs/clean/model.pt --set 'backbone="brits"' --seed 13
+missingness-games train --input data/har --output runs/saits --config data/har.config.json --variant fixed_bank --reference runs/clean/model.pt --set 'backbone="saits"' --seed 13
+missingness-games train --input data/har --output runs/timesnet --config data/har.config.json --variant fixed_bank --reference runs/clean/model.pt --set 'backbone="timesnet"' --seed 13
+missingness-games train --input data/har --output runs/biot --config data/har.config.json --variant fixed_bank --reference runs/clean/model.pt --set 'backbone="biot"' --seed 13
+python -m missingness_games.evaluate_policies --input data/har/test.npz --model runs/biot/model.pt --output runs/biot/policies --seed 13
+```
+
+All use the same prepared subjects, training-only transforms/guard and frozen observation bank. GRU-D/BRITS use true revealed-value LOCF and elapsed clocks; BRITS backward imputation uses only entries actually revealed in the end-window recognition task. SAITS additionally reconstructs observed inputs; BRITS retains its source reconstruction and consistency losses. These auxiliary losses default to weight 1 and can be declared through reconstruction_weight. TimesNet/BIOT receive explicit value/mask/elapsed channels. Default widths are 64 and BIOT 128; small functional fixtures override width to 8. BIOT uses n_fft=min(64,T), half-window hop and no pretrained signal resampling; the n_fft choice is explicit because the manuscript does not fix it. Its optional linear-attention dependency is installed by the baselines extra.
+
+`verify.py` actually fits all five architecture adaptations through the common CLI for one generated epoch, checks a learned upstream parameter gradient/update, reload equality and frozen metrics, in addition to the ten allocation variants and native-rarity panels. Local BIOT dependencies were installed only into ignored runs/biot-deps, without changing the shared Python environment. Generated tests establish execution, not paper accuracy.
+
+Training policy draws use a separate RNG fork keyed by training seed and predictor-update number, so backbone initialization and dropout cannot change shared masks. Evaluation fixes the represented history threshold to the frozen training 60th percentile for every checkpoint, including clean controls, independently of its optimizer-step counter. Functional checks compare actual history-burst masks across all five external architectures and the primary predictor.

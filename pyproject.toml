@@ -16,4 +16,7 @@ missingness-games = "missingness_games.cli:main"
 include = ["missingness_games*"]
 
 [tool.setuptools.package-data]
-missingness_games = ["heldout.json"]
+missingness_games = ["heldout.json","vendor/pypots/LICENSE","vendor/timesnet/LICENSE","vendor/biot/LICENSE"]
+
+[project.optional-dependencies]
+baselines=["linear-attention-transformer==0.19.1","local-attention==1.11.2","linformer==0.2.3","product-key-memory==0.3.0","axial-positional-embedding==0.3.12","hyper-connections==0.4.11","einx==0.4.3","beartype==0.23.1","colt5-attention==0.11.2"]

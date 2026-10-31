@@ -75,7 +75,7 @@ def train(args, config, output):
         raise ValueError('Training and validation groups overlap')
     config.setdefault('input_shape', list(data['x'].shape[1:]))
     config.setdefault('classes', int(data['y'].max()) + 1)
-    config.setdefault('width', 64)
+    config.setdefault('width',128 if config.get('backbone')=='biot' else 64)
     model = Model(config).to(args.device)
     model.prepare(data)
     if args.init:

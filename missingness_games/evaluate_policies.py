@@ -39,6 +39,7 @@ def main():
         config["max_gap"] = args.max_gap
     model = Model(config).to(args.device).eval()
     model.load_state_dict(saved["state"])
+    model.c["evaluation_history_quantile"]=.6
     data = read(args.input)
     if "group" not in data:
         raise ValueError("Evaluation requires independent subject/run group IDs")
@@ -115,7 +116,7 @@ def main():
         "clean_subject_macro_accuracy": rows[0]["subject_macro_accuracy"],
         "represented_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[1:5]), axis=0).mean()),
         "heldout_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[5:]), axis=0).mean()),
-        "conditions": [r["condition"] for r in rows], "heldout_bank":bank,
+        "conditions": [r["condition"] for r in rows], "heldout_bank":bank, "represented_history_quantile":.6,
         "seed": args.seed, "batch_size": args.batch_size, "count_preserving_temporal_shuffle": args.shuffle_masks,
         "deletion_fraction": config.get("deletion_fraction", .4),
         "max_gap": config.get("max_gap", data["x"].shape[1] // 4),
