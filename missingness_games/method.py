@@ -170,7 +170,7 @@ class Model(nn.Module):
             self.updates.add_(1)
         weights = (self.reference.log() + self.memory / temperature).softmax(0).detach()
         if self.c['variant'] == 'fixed_bank':
-            weights = self.reference.detach()
+            weights = torch.full_like(losses, .25)
         elif self.c['variant'] in ('random_only', 'fixed_hard'):
             index = 0 if self.c['variant'] == 'random_only' else int(self.c['fixed_hard_index'])
             weights = F.one_hot(torch.tensor(index, device=losses.device), 4).to(losses)
