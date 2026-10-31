@@ -1,3 +1,4 @@
+"""Train and evaluate the finite-bank observation game on group-disjoint NPZ data."""
 import argparse
 import json
 import time
@@ -6,256 +7,223 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .method import Model, VARIANTS, demo
 from .metrics import measure
 
 
 def read(path):
-    with np.load(path, allow_pickle=False) as data:
-        return {k: data[k] for k in data.files}
+    with np.load(path, allow_pickle=False) as archive:
+        return {key: archive[key] for key in archive.files}
 
 
-def dump(path, data):
-    Path(path).write_text(json.dumps(data, indent=2, allow_nan=False), encoding="utf-8")
+def dump(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False), encoding='utf-8')
 
 
 def tensor_batch(data, indices, device):
-    return {k: torch.as_tensor(v[indices], device=device) for k, v in data.items()
-            if v.ndim and len(v) == len(data["x"]) and v.dtype.kind in "biuf"}
+    return {key: torch.as_tensor(value[indices], device=device) for key, value in data.items()
+            if value.ndim and len(value) == len(data['x']) and value.dtype.kind in 'biuf'}
+
+
+def prepare(source, output):
+    data = read(source)
+    n = len(data['x'])
+    if data['x'].ndim != 3 or data['y'].shape != (n,) or data['y'].dtype.kind not in 'iu' or (data['y'] < 0).any():
+        raise ValueError('Require x[N,T,D] and integer sequence labels y[N]')
+    groups = data.get('group', np.arange(n))
+    if 'split' in data:
+        codes = sorted(np.unique(data['split']).tolist())
+        if codes not in ([0, 1, 2], [0, 1, 2, 3]):
+            raise ValueError('Use split codes 0/1/2 or 0/1/2/3')
+        masks = [data['split'] == code for code in codes]
+    else:
+        unique = np.unique(groups)
+        first, second, third = [int(f * len(unique)) for f in (.6, .75, .85)]
+        masks = [np.isin(groups, part) for part in (unique[:first], unique[first:second], unique[second:third], unique[third:])]
+    names = ('train', 'validation', 'test') if len(masks) == 3 else ('train', 'validation', 'calibration', 'test')
+    for i, (name, selected) in enumerate(zip(names, masks)):
+        if not selected.any():
+            raise ValueError('Every declared split must be nonempty')
+        if any(np.intersect1d(groups[selected], groups[other]).size for other in masks[:i]):
+            raise ValueError('A subject/run group crosses split boundaries')
+        values = {key: value[selected] if value.ndim and len(value) == n else value for key, value in data.items() if key != 'split'}
+        values['group'] = groups[selected]
+        np.savez_compressed(output / f'{name}.npz', **values)
+
+
+@torch.no_grad()
+def validate(model, data, batch_size, device, seed):
+    model.eval()
+    clean, risks = 0., np.zeros(4)
+    devices = [torch.device(device).index or 0] if device.startswith('cuda') else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        for start in range(0, len(data['x']), batch_size):
+            indices = np.arange(start, min(start + batch_size, len(data['x'])))
+            clean_sum, policy_sum = model.selection_metrics(tensor_batch(data, indices, device))
+            clean += clean_sum; risks += policy_sum
+    return clean / len(data['x']), risks / len(data['x'])
+
+
+def train(args, config, output):
+    if min(args.epochs, args.batch_size, args.patience, args.lr) <= 0:
+        raise ValueError('Positive training budgets and learning rate required')
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    data = read(Path(args.input) / 'train.npz')
+    validation = read(Path(args.input) / 'validation.npz')
+    if np.intersect1d(data['group'], validation['group']).size:
+        raise ValueError('Training and validation groups overlap')
+    config.setdefault('input_shape', list(data['x'].shape[1:]))
+    config.setdefault('classes', int(data['y'].max()) + 1)
+    config.setdefault('width', 64)
+    model = Model(config).to(args.device)
+    model.prepare(data)
+    if args.init:
+        model.load_state_dict(torch.load(args.init, map_location=args.device, weights_only=True)['state'])
+    reference_ce = None
+    if args.variant not in ('baseline', 'unguarded'):
+        if not args.reference:
+            raise ValueError('Guarded training requires --reference from a clean-trained baseline')
+        reference = torch.load(args.reference, map_location=args.device, weights_only=True)
+        if set(reference['training_groups']) != set(np.unique(data['group']).tolist()) or set(reference['validation_groups']) != set(np.unique(validation['group']).tolist()):
+            raise ValueError('Reference must use the same training and development groups')
+        clean_model = Model(reference['config']).to(args.device)
+        clean_model.load_state_dict(reference['state'])
+        reference_ce = validate(clean_model, validation, args.batch_size, args.device, args.seed)[0]
+    if args.variant == 'fixed_hard' and 'fixed_hard_index' not in config:
+        raise ValueError('fixed_hard requires a policy index selected by a separate training-only pilot')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=config.get('weight_decay', 1e-4))
+    history, best, stale, saved = [], float('inf'), 0, False
+    best_stopping = float('inf')
+    started = time.perf_counter()
+    for epoch in range(args.epochs):
+        model.train(); total = 0.; diagnostics = []
+        for indices in np.array_split(np.random.permutation(len(data['x'])), max(1, int(np.ceil(len(data['x']) / args.batch_size)))):
+            batch = tensor_batch(data, indices, args.device)
+            prediction = model(batch); loss = model.objective(batch, prediction)
+            if not torch.isfinite(loss):
+                raise FloatingPointError('Nonfinite training objective')
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            total += float(loss.detach()) * len(indices)
+            if model.last_diagnostics:
+                diagnostics.append(model.last_diagnostics)
+        clean, risks = validate(model, validation, args.batch_size, args.device, args.seed)
+        tolerance = float(config.get('clean_guard_tolerance', .015))
+        if tolerance < 0:
+            raise ValueError('clean_guard_tolerance must be nonnegative')
+        eligible = reference_ce is None or clean <= reference_ce + tolerance
+        score = clean if args.variant == 'baseline' else float(risks.max())
+        history.append(dict(epoch=epoch + 1, training_loss=total / len(data['x']), clean_validation_ce=clean,
+            reference_clean_ce=reference_ce, validation_policy_ce=risks.tolist(), validation_risk=score,
+            eligible=eligible, allocation=diagnostics))
+        if eligible and score < best:
+            best, saved = score, True
+            torch.save(dict(state=model.state_dict(), config=config,
+                training_groups=np.unique(data['group']).tolist(), validation_groups=np.unique(validation['group']).tolist(),
+                reference_clean_ce=reference_ce, selected_epoch=epoch + 1), output / 'model.pt')
+        if score < best_stopping:
+            best_stopping, stale = score, 0
+        else:
+            stale += 1
+        if stale >= args.patience:
+            break
+    dump(output / 'history.json', history)
+    if not saved:
+        raise RuntimeError('No checkpoint satisfies clean CE <= reference CE + tolerance; see history.json')
+    dump(output / 'training.json', dict(seconds=time.perf_counter()-started, best_validation_loss=best,
+        seed=args.seed, epochs=len(history), batch_size=args.batch_size, learning_rate=args.lr, variant=args.variant))
+
+
+def load_model(path, device):
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    model = Model(checkpoint['config']).to(device).eval()
+    model.load_state_dict(checkpoint['state'])
+    return model, checkpoint
+
+
+@torch.no_grad()
+def evaluate(args, output):
+    model, checkpoint = load_model(args.model, args.device)
+    data = read(args.input)
+    excluded = checkpoint['training_groups'] + checkpoint['validation_groups'] + checkpoint.get('calibration_groups', [])
+    if np.intersect1d(data['group'], excluded).size:
+        raise ValueError('Evaluation groups overlap fitting/selection/calibration groups')
+    probabilities = []
+    for start in range(0, len(data['x']), args.batch_size):
+        indices = np.arange(start, min(start + args.batch_size, len(data['x'])))
+        p = model(tensor_batch(data, indices, args.device))['probability']
+        if 'classification_temperature' in checkpoint:
+            p = (p.clamp_min(1e-10).log()/checkpoint['classification_temperature']).softmax(-1)
+        probabilities.append(p.cpu().numpy())
+    prediction = dict(probability=np.concatenate(probabilities))
+    np.savez_compressed(output/'predictions.npz', **prediction)
+    dump(output/'metrics.json', measure(prediction, data))
 
 
 def main():
-    from . import method
     parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["demo", "prepare", "train", "evaluate", "plot", "pack", "calibrate"] + (["execute"] if hasattr(method, "execute") else []):
+    sub = parser.add_subparsers(dest='command', required=True)
+    for name in ('demo', 'prepare', 'train', 'evaluate', 'calibrate', 'pilot', 'plot'):
         p = sub.add_parser(name)
-        p.add_argument("--output", required=True)
-        p.add_argument("--input")
-        p.add_argument("--config")
-        p.add_argument("--set", action="append", default=[])
-        p.add_argument("--variant", default="full")
-        p.add_argument("--seed", type=int, default=13)
-        p.add_argument("--epochs", type=int, default=100)
-        p.add_argument("--batch-size", type=int, default=16)
-        p.add_argument("--lr", type=float, default=0.001)
-        p.add_argument("--device", default="cpu")
-        p.add_argument("--model")
-        p.add_argument("--init")
-        p.add_argument("--images")
-        p.add_argument("--targets")
-        p.add_argument("--size", type=int, default=64)
-        p.add_argument("--mask", action="store_true")
-        p.add_argument("--count", type=int, default=96)
+        p.add_argument('--output', required=True); p.add_argument('--input'); p.add_argument('--model')
+        p.add_argument('--config'); p.add_argument('--set', action='append', default=[])
+        p.add_argument('--variant', choices=VARIANTS, default='full')
+        p.add_argument('--seed', type=int, default=13); p.add_argument('--count', type=int, default=96)
+        p.add_argument('--epochs', type=int, default=150); p.add_argument('--patience', type=int, default=20)
+        p.add_argument('--batch-size', type=int, default=64); p.add_argument('--lr', type=float, default=.001)
+        p.add_argument('--device', default='cpu'); p.add_argument('--init'); p.add_argument('--reference'); p.add_argument('--pilot')
     args = parser.parse_args()
-    config = json.loads(Path(args.config).read_text()) if args.config else {}
+    config = json.loads(Path(args.config).read_text(encoding='utf-8-sig')) if args.config else {}
     for setting in args.set:
-        key, value = setting.split("=", 1)
-        config[key] = json.loads(value)
-    config["variant"] = args.variant
-    out = Path(args.output)
-    if args.command in {"train", "evaluate", "plot", "prepare"}:
-        out.mkdir(parents=True, exist_ok=True)
-    else:
-        out.parent.mkdir(parents=True, exist_ok=True)
-    if args.command == "execute":
-        method.execute(args)
-    elif args.command == "demo":
-        np.savez_compressed(out, **method.demo(args.seed, args.count, config))
-    elif args.command == "pack":
-        from PIL import Image
-        paths = sorted(p for p in Path(args.images).iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".bmp"})
-        inputs, targets = [], []
-        for path in paths:
-            with Image.open(path) as image:
-                inputs.append(np.asarray(image.convert("RGB").resize((args.size, args.size)), dtype=np.float32).transpose(2, 0, 1) / 255)
-            target = Path(args.targets) / path.name
-            with Image.open(target) as image:
-                if args.mask:
-                    targets.append((np.asarray(image.convert("L").resize((args.size, args.size), Image.Resampling.NEAREST)) > 127).astype(np.float32)[None])
-                else:
-                    targets.append(np.asarray(image.convert("RGB").resize((args.size, args.size)), dtype=np.float32).transpose(2, 0, 1) / 255)
-        if not paths:
-            raise ValueError("No image pairs found")
-        np.savez_compressed(out, x=np.stack(inputs), y=np.stack(targets), group=np.arange(len(paths)))
-    elif args.command == "prepare":
+        key, value = setting.split('=', 1); config[key] = json.loads(value)
+    if args.pilot:
+        config['fixed_hard_index'] = json.loads(Path(args.pilot).read_text(encoding='utf-8'))['fixed_hard_index']
+    config['variant'] = args.variant
+    output = Path(args.output)
+    (output.parent if args.command in ('demo', 'calibrate', 'pilot') else output).mkdir(parents=True, exist_ok=True)
+    if args.command == 'demo':
+        np.savez_compressed(output, **demo(args.seed, args.count, config))
+    elif args.command == 'prepare':
+        prepare(args.input, output)
+    elif args.command == 'train':
+        train(args, config, output)
+    elif args.command == 'evaluate':
+        evaluate(args, output)
+    elif args.command == 'pilot':
+        model, checkpoint = load_model(args.model, args.device)
         data = read(args.input)
-        n = len(data["x"])
-        if "y" not in data or len(data["y"]) != n:
-            raise ValueError("x and y must have matching sample counts")
-        groups = data.get("group", np.arange(n))
-        if "split" in data:
-            assignment = data["split"]
-            codes = [0, 1, 2, 3] if np.max(assignment) == 3 else [0, 1, 2]
-            masks = [assignment == code for code in codes]
-        else:
-            unique = np.unique(groups)
-            first, second, third = [int(f * len(unique)) for f in [.6, .75, .85]]
-            masks = [np.isin(groups, selected) for selected in [unique[:first], unique[first:second], unique[second:third], unique[third:]]]
-        for i, mask in enumerate(masks):
-            if not mask.any():
-                raise ValueError("Each train/validation/test partition must be nonempty")
-            for other in masks[:i]:
-                if np.intersect1d(groups[mask], groups[other]).size:
-                    raise ValueError("A group crosses split boundaries")
-            values = {k: v[mask] if v.ndim and len(v) == n else v for k, v in data.items() if k != "split"}
-            names = ["train.npz", "validation.npz", "calibration.npz", "test.npz"] if len(masks) == 4 else ["train.npz", "validation.npz", "test.npz"]
-            np.savez_compressed(out / names[i], **values)
-    elif args.command == "train":
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        data = read(Path(args.input) / "train.npz")
-        validation = read(Path(args.input) / "validation.npz")
-        config.setdefault("input_shape", list(data["x"].shape[1:]))
-        config.setdefault("classes", int(np.max(data.get("state", data["y"]))) + 1 if data["y"].ndim == 1 and data["y"].dtype.kind in "iu" else 2)
-        network = method.Model(config).to(args.device)
-        if args.init:
-            initial = torch.load(args.init, map_location=args.device, weights_only=True)
-            network.load_state_dict(initial["state"])
-        elif hasattr(network, "prepare"):
-            network.prepare(data)
-        optimizer = torch.optim.AdamW(network.parameters(), lr=args.lr)
-        history, best = [], float("inf")
-        clean_cap=float(config.get('clean_risk_cap',.5))
-        if not 0<=clean_cap<=1:raise ValueError('clean_risk_cap must lie in [0,1]')
-        saved_any=False
-        start = time.perf_counter()
-        for epoch in range(args.epochs):
-            network.train()
-            train_loss = 0.
-            for indices in np.array_split(np.random.permutation(len(data["x"])), max(1, int(np.ceil(len(data["x"]) / args.batch_size)))):
-                batch = tensor_batch(data, indices, args.device)
-                prediction = network(batch)
-                loss = network.objective(batch, prediction)
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("Nonfinite training objective")
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                train_loss += float(loss.detach()) * len(indices)
-            network.eval()
-            total = 0.
-            clean_errors=0
-            for begin in range(0, len(validation["x"]), args.batch_size):
-                indices = np.arange(begin, min(begin + args.batch_size, len(validation["x"])))
-                batch = tensor_batch(validation, indices, args.device)
-                devices=[torch.device(args.device)] if args.device.startswith('cuda') else []
-                with torch.random.fork_rng(devices=devices):
-                    torch.manual_seed(args.seed+begin)
-                    errors,robust_loss=network.selection_metrics(batch)
-                clean_errors+=errors
-                total+=robust_loss
-            score = total / len(validation["x"])
-            clean_risk=clean_errors/len(validation['x'])
-            eligible=clean_risk<=clean_cap
-            history.append({"epoch": epoch + 1, "training_loss": train_loss / len(data["x"]), "validation_loss": score, 'clean_risk':clean_risk,'eligible':eligible})
-            if eligible and score < best:
-                saved_any=True
-                best = score
-                torch.save({"state": network.state_dict(), "config": config, "training_groups": np.unique(data.get("group", np.arange(len(data["x"])))).tolist(), "validation_groups": np.unique(validation.get("group", np.arange(len(validation["x"])))).tolist()}, out / "model.pt")
-        dump(out / "history.json", history)
-        if not saved_any:raise RuntimeError('No checkpoint meets the predeclared clean_risk_cap; inspect history.json')
-        dump(out / "training.json", {
-            "seconds": time.perf_counter() - start,
-            "best_validation_loss": best,
-            "seed": args.seed,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "device": args.device,
-            "variant": args.variant,
-        })
-    elif args.command == "calibrate":
+        if set(np.unique(data['group']).tolist()) != set(checkpoint['training_groups']):
+            raise ValueError('Policy pilot must use the clean control training groups only')
+        _, risks = validate(model, data, args.batch_size, args.device, args.seed)
+        dump(output, dict(fixed_hard_index=int(risks.argmax()), training_policy_ce=risks.tolist()))
+    elif args.command == 'calibrate':
         from scipy.optimize import minimize_scalar
         from scipy.special import softmax
-        from sklearn.metrics import log_loss
-        state = torch.load(args.model, map_location=args.device, weights_only=True)
-        network = method.Model(state["config"]).to(args.device)
-        network.load_state_dict(state["state"])
-        network.eval()
+        model, checkpoint = load_model(args.model, args.device)
         data = read(args.input)
-        if "group" not in data:
-            raise ValueError("Calibration requires globally unique independent group IDs")
-        excluded = state.get("training_groups", []) + state.get("validation_groups", [])
-        if np.intersect1d(data["group"], excluded).size:
-            raise ValueError("Calibration groups overlap fitting or checkpoint-selection groups")
-        prediction = network(tensor_batch(data, np.arange(len(data["x"])), args.device))
-        if "probability" in prediction and data["y"].ndim == 1:
-            logits = np.log(np.clip(prediction["probability"].detach().cpu().numpy(), 1e-10, 1))
-            result = minimize_scalar(lambda value: log_loss(data["y"], softmax(logits / np.exp(value), axis=1), labels=np.arange(logits.shape[1])), bounds=(-3, 3), method="bounded")
-            state["classification_temperature"] = float(np.exp(result.x))
-        else:
-            if "lower" in prediction:
-                lower, upper = prediction["lower"], prediction["upper"]
-            elif "prediction" in prediction:
-                lower = upper = prediction["prediction"]
-            else:
-                raise ValueError("Calibration needs class probabilities or numeric prediction bounds")
-            truth = torch.as_tensor(data["y"], device=lower.device)
-            score = torch.maximum(torch.maximum(lower-truth, truth-upper), torch.zeros_like(lower)).reshape(len(truth), -1).max(-1).values.detach().cpu().numpy()
-            unit = [score[data["group"] == group].max() for group in np.unique(data["group"])]
-            rank = int(np.ceil((len(unit)+1)*.9))
-            state["interval_expansion"] = float(np.sort(unit)[rank-1]) if rank <= len(unit) else float("inf")
-        state["calibration_groups"]=np.unique(data["group"]).tolist()
-        torch.save(state, out)
-    elif args.command == "evaluate":
-        state = torch.load(args.model, map_location=args.device, weights_only=True)
-        network = method.Model(state["config"]).to(args.device)
-        network.load_state_dict(state["state"])
-        network.eval()
-        data = read(args.input)
-        stored, elapsed = {}, []
-        for begin in range(0, len(data["x"]), args.batch_size):
-            indices = np.arange(begin, min(begin + args.batch_size, len(data["x"])))
-            batch = tensor_batch(data, indices, args.device)
-            if args.device.startswith("cuda"):
-                torch.cuda.synchronize()
-            start = time.perf_counter()
-            prediction = network(batch)
-            if "classification_temperature" in state and "probability" in prediction:
-                prediction["probability"] = (prediction["probability"].clamp_min(1e-10).log() / state["classification_temperature"]).softmax(-1)
-            if "interval_expansion" in state:
-                lower = prediction.get("lower", prediction.get("prediction"))
-                upper = prediction.get("upper", prediction.get("prediction"))
-                prediction["lower"] = lower-state["interval_expansion"]
-                prediction["upper"] = upper+state["interval_expansion"]
-                if "bound_lower" in prediction:
-                    prediction["lower"] = torch.maximum(prediction["lower"], prediction["bound_lower"])
-                    prediction["upper"] = torch.minimum(prediction["upper"], prediction["bound_upper"])
-            if args.device.startswith("cuda"):
-                torch.cuda.synchronize()
-            elapsed.append((time.perf_counter() - start) / len(indices))
-            for key, value in prediction.items():
-                if isinstance(value, torch.Tensor) and value.ndim and len(value) == len(indices):
-                    stored.setdefault(key, []).append(value.detach().cpu().numpy())
-        result = {key: np.concatenate(values) for key, values in stored.items()}
-        values = measure(result, data)
-        if hasattr(method, "measure"):
-            values.update(method.measure(result, data, state["config"]))
-        values.update(parameters=sum(p.numel() for p in network.parameters()),
-                      mean_latency_ms=1000 * float(np.mean(elapsed)),
-                      p95_latency_ms=1000 * float(np.quantile(elapsed, .95)))
-        np.savez_compressed(out / "predictions.npz", **result)
-        dump(out / "metrics.json", values)
-    elif args.command == "plot":
+        if np.intersect1d(data['group'], checkpoint['training_groups']+checkpoint['validation_groups']).size:
+            raise ValueError('Calibration groups overlap fitting/selection groups')
+        with torch.no_grad():
+            logits = model(tensor_batch(data, np.arange(len(data['x'])), args.device))['clean_logits'].cpu().numpy()
+        result = minimize_scalar(lambda value: -np.log(softmax(logits/np.exp(value),axis=1)[np.arange(len(logits)), data['y']].clip(1e-10)).mean(), bounds=(-3,3), method='bounded')
+        checkpoint['classification_temperature'] = float(np.exp(result.x))
+        checkpoint['calibration_groups'] = np.unique(data['group']).tolist(); torch.save(checkpoint, output)
+    else:
         import matplotlib
-        matplotlib.use("Agg")
+        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        paths = list(Path(args.input).rglob("metrics.json"))
-        if not paths:
-            raise ValueError("No evaluated metrics")
-        records = [json.loads(p.read_text()) for p in paths]
-        for key in sorted(set().union(*(set(r) for r in records))):
-            if not all(isinstance(r.get(key), (int, float)) for r in records):
-                continue
-            fig, ax = plt.subplots(figsize=(9, 4))
-            ax.bar([str(p.parent.relative_to(args.input)) for p in paths], [r[key] for r in records], color="#4d8495")
-            ax.set_ylabel(key)
-            ax.tick_params(axis="x", labelrotation=30)
-            fig.tight_layout()
-            fig.savefig(out / (key + ".png"), dpi=180)
-            plt.close(fig)
+        paths = list(Path(args.input).rglob('metrics.json'))
+        records = [(path, json.loads(path.read_text(encoding='utf-8'))) for path in paths]
+        records = [(path, value) for path, value in records if isinstance(value, dict)]
+        if not records:
+            raise ValueError('No scalar evaluated metric records')
+        for key in sorted(set().union(*(value.keys() for _,value in records))):
+            selected = [(path,value[key]) for path,value in records if isinstance(value.get(key),(int,float))]
+            if not selected: continue
+            figure, axis = plt.subplots(figsize=(9,4))
+            axis.bar([str(path.parent.relative_to(args.input)) for path,_ in selected],[value for _,value in selected])
+            axis.tick_params(axis='x',labelrotation=30);axis.set_ylabel(key);figure.tight_layout()
+            figure.savefig(output/f'{key}.png',dpi=160);plt.close(figure)
 
 
-if __name__ == "__main__":
-    main()
-
+if __name__ == '__main__': main()

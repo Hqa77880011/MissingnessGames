@@ -1,8 +1,9 @@
 {
-  "width": 32,
-  "deletion_fraction": 0.25,
-  "max_gap": 4,
+  "width": 64,
+  "deletion_fraction": 0.4,
   "temperature": 0.2,
   "memory": 0.9,
-  "clean_risk_cap": 0.5
+  "robust_weight": 1.0,
+  "clean_guard_tolerance": 0.015,
+  "weight_decay": 0.0001
 }

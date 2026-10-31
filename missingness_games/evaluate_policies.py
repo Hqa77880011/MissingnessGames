@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--deletion-fraction", type=float)
     parser.add_argument("--max-gap", type=int)
+    parser.add_argument("--shuffle-masks", action="store_true", help="Count-preserving temporal intervention within originally observed positions")
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("batch-size must be positive")
@@ -44,7 +45,7 @@ def main():
     excluded=saved.get('training_groups',[])+saved.get('validation_groups',[])+saved.get('calibration_groups',[])
     if np.intersect1d(data['group'],excluded).size:raise ValueError('Evaluation groups overlap fitting/checkpoint/calibration groups')
     rows, condition_group_scores = [], []
-    for index, condition in enumerate(["clean", "random", "persistent", "history", "periodic", "heldout_low_history", "heldout_alternating_block"]):
+    for index, condition in enumerate(["clean", "independent", "channel_burst", "group_burst", "history_burst", "heldout_reverse_history", "heldout_duration_shift"]):
         # The same seed, input order and batch size give all variants the same masks.
         torch.manual_seed(args.seed)
         probabilities, masks = [], []
@@ -56,6 +57,12 @@ def main():
                 observed = batch.get("mask", torch.isfinite(raw)).bool()
                 values = torch.nan_to_num(raw)
                 mask = observed.float() if index == 0 else model.policy(values, index - 1, observed)
+                if args.shuffle_masks and index > 0:
+                    for row in range(len(mask)):
+                        for channel in range(mask.shape[2]):
+                            positions = observed[row, :, channel].nonzero().flatten()
+                            order = torch.randperm(len(positions), device=mask.device)
+                            mask[row, positions, channel] = mask[row, positions[order], channel].clone()
                 prediction = model({"x": values, "mask": mask})["probability"]
                 if "classification_temperature" in saved:
                     prediction = (prediction.clamp_min(1e-10).log() / saved["classification_temperature"]).softmax(-1)
@@ -69,8 +76,16 @@ def main():
             for group in np.unique(data["group"])
         ]
         condition_group_scores.append(group_scores)
+        native = np.asarray(data.get("mask", np.isfinite(data["x"]))).astype(bool) & np.isfinite(data["x"])
+        introduced = native & ~mask.astype(bool)
+        gap = np.zeros((len(mask), mask.shape[2]), dtype=int)
+        maximum_gap = 0
+        for step in range(mask.shape[1]):
+            gap = (gap + 1) * (~mask[:, step].astype(bool))
+            maximum_gap = max(maximum_gap, int(gap.max()))
         metrics.update(condition=condition, subject_macro_accuracy=float(np.mean(group_scores)),
-                       observed_fraction=float(mask.mean()))
+                       observed_fraction=float(mask.mean()), native_missing_fraction=float(1-native.mean()),
+                       introduced_missing_fraction=float(introduced.mean()), maximum_effective_gap=maximum_gap)
         rows.append(metrics)
         np.savez_compressed(output / (condition + ".npz"), probability=probability,
                             mask=mask, y=data["y"], group=data["group"])
@@ -80,9 +95,9 @@ def main():
         "represented_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[1:5]), axis=0).mean()),
         "heldout_worst_subject_macro_accuracy": float(np.min(np.asarray(condition_group_scores[5:]), axis=0).mean()),
         "conditions": [r["condition"] for r in rows],
-        "seed": args.seed, "batch_size": args.batch_size,
-        "deletion_fraction": config.get("deletion_fraction", .25),
-        "max_gap": config.get("max_gap", 4),
+        "seed": args.seed, "batch_size": args.batch_size, "count_preserving_temporal_shuffle": args.shuffle_masks,
+        "deletion_fraction": config.get("deletion_fraction", .4),
+        "max_gap": config.get("max_gap", data["x"].shape[1] // 4),
     })
 
 
