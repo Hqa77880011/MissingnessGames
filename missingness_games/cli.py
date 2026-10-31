@@ -87,9 +87,11 @@ def train(args, config, output):
         reference = torch.load(args.reference, map_location=args.device, weights_only=True)
         if set(reference['training_groups']) != set(np.unique(data['group']).tolist()) or set(reference['validation_groups']) != set(np.unique(validation['group']).tolist()):
             raise ValueError('Reference must use the same training and development groups')
-        clean_model = Model(reference['config']).to(args.device)
-        clean_model.load_state_dict(reference['state'])
-        reference_ce = validate(clean_model, validation, args.batch_size, args.device, args.seed)[0]
+        devices = [torch.device(args.device).index or 0] if args.device.startswith('cuda') else []
+        with torch.random.fork_rng(devices=devices):
+            clean_model = Model(reference['config']).to(args.device)
+            clean_model.load_state_dict(reference['state'])
+            reference_ce = validate(clean_model, validation, args.batch_size, args.device, args.seed)[0]
     if args.variant == 'fixed_hard' and 'fixed_hard_index' not in config:
         raise ValueError('fixed_hard requires a policy index selected by a separate training-only pilot')
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=config.get('weight_decay', 1e-4))
@@ -179,6 +181,7 @@ def main():
     if args.pilot:
         config['fixed_hard_index'] = json.loads(Path(args.pilot).read_text(encoding='utf-8'))['fixed_hard_index']
     config['variant'] = args.variant
+    config['seed'] = args.seed
     output = Path(args.output)
     (output.parent if args.command in ('demo', 'calibrate', 'pilot') else output).mkdir(parents=True, exist_ok=True)
     if args.command == 'demo':

@@ -179,7 +179,8 @@ class Model(nn.Module):
                 self.dro_weights.copy_((self.dro_weights.log() + self.c.get('dro_step_size', .01) * losses.detach()).softmax(0))
             weights = self.dro_weights.detach().clone()
         elif self.c['variant'] == 'permuted':
-            weights = weights[torch.randperm(4, device=weights.device)]
+            generator = torch.Generator(device=weights.device).manual_seed(self.c.get('seed', 13) + int(self.updates))
+            weights = weights[torch.randperm(4, device=weights.device, generator=generator)]
         self.last_diagnostics = dict(policy_losses=losses.detach().cpu().tolist(),
             memory=self.memory.cpu().tolist(), weights=weights.cpu().tolist(),
             introduced_missing_rates=prediction['realized_missing_rates'].detach().cpu().tolist())

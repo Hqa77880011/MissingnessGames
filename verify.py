@@ -74,9 +74,15 @@ def main():
     for variant in VARIANTS:
         if variant=='baseline':continue
         invoke('train','--input',root/'data','--output',root/variant,'--config',root/'config.json',
-            '--variant',variant,'--epochs',1,'--reference',root/'baseline/model.pt','--pilot',root/'pilot.json')
+            '--variant',variant,'--epochs',1,'--batch-size',12,'--reference',root/'baseline/model.pt','--pilot',root/'pilot.json')
         history=json.loads((root/variant/'history.json').read_text())
         assert np.isfinite(history[0]['training_loss']) and history[0]['eligible']
+    guarded=torch.load(root/'full/model.pt',weights_only=True)['state']
+    unguarded=torch.load(root/'unguarded/model.pt',weights_only=True)['state']
+    for key in guarded:torch.testing.assert_close(guarded[key],unguarded[key],rtol=0,atol=0)
+    full_history=json.loads((root/'full/history.json').read_text())[0]['allocation']
+    permuted_history=json.loads((root/'permuted/history.json').read_text())[0]['allocation']
+    assert [row['introduced_missing_rates'] for row in full_history]==[row['introduced_missing_rates'] for row in permuted_history]
     invoke('evaluate','--input',root/'data/test.npz','--model',root/'full/model.pt','--output',root/'evaluation')
     invoke('calibrate','--input',root/'data/calibration.npz','--model',root/'full/model.pt','--output',root/'calibrated.pt')
     invoke('evaluate','--input',root/'data/test.npz','--model',root/'calibrated.pt','--output',root/'calibrated_evaluation')

@@ -56,7 +56,7 @@ missingness-games calibrate --input data/custom/calibration.npz --model runs/ful
 
 ## Baselines and ablations
 
-Use the same prepared data, initialization seed, reference, raw-window batch size and update budget. `--variant` supports `full`, `baseline`, `fixed_bank` (uniform bank), `group_dro`, `fixed_hard`, `no_memory`, `random_only`, `permuted` (weight assignment), `independent_masks` (four IID views), and `unguarded`. Guarded and unguarded training use the same stopping risk independently of eligibility. The fixed-hard policy is selected on training data in a separate clean-model pilot:
+Use the same prepared data, initialization seed, reference, raw-window batch size and update budget. `--variant` supports `full`, `baseline`, `fixed_bank` (uniform bank), `group_dro`, `fixed_hard`, `no_memory`, `random_only`, `permuted` (weight assignment), `independent_masks` (four IID views), and `unguarded`. Guarded and unguarded training use identical training randomness and stopping risk independently of eligibility; loading a clean reference preserves the learner RNG, and weight permutation uses a separate generator. The fixed-hard policy is selected on training data in a separate clean-model pilot:
 
 ```bash
 missingness-games pilot --input data/har/train.npz --model runs/clean/model.pt --output runs/pilot.json --seed 13
