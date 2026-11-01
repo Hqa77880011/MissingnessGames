@@ -1,4 +1,4 @@
-"""CPU functional checks; generated observations do not estimate paper performance."""
+"""CPU functional checks with generated sensor observations."""
 import argparse
 import json
 import sys
